@@ -15,6 +15,7 @@ type FeedInfo struct {
     Stat           string
     Size           string
     VacanciesCount int64
+    FailureSince   time.Time
 }
 
 const FeedsLimit = 32
@@ -41,26 +42,32 @@ func getFeedSize(url string) (size string, stat []byte) {
     return string(re.FindSubmatch(stat)[1][:]), stat
 }
 
-func updateInfoIfNeed(url string, feeds map[string]FeedInfo) {
+func feedIsAlive(url string) bool {
+    size, _ := getFeedSize(url)
+    return size != ""
+}
+
+func updateInfoIfNeed(url string, feeds map[string]FeedInfo) error {
     size, stat := getFeedSize(url)
     if size == "" {
-        log.Printf("Error getting feed %s size - skip info update\n", url)
-        return
+        return fmt.Errorf("Error getting feed %s size - skip info update\n", url)
     }
 
     fi, ok := feeds[url]
     if !ok || fi.Size != size {
-        fmt.Printf("counting vacancies...")
+        log.Printf("counting vacancies for %s", url)
         vc, err := countVacancies(url)
         if err != nil {
-            log.Printf("Error counting vacancies: %v\n", err)
-            return
+            return fmt.Errorf("Error counting vacancies: %v", err)
         }
-        feeds[url] = FeedInfo{Stat: string(stat[:]), Size: size, VacanciesCount: vc}
-        fmt.Println(feeds[url].VacanciesCount)
-    } else {
-        fmt.Printf(".")
+        feeds[url] = FeedInfo{
+            Stat:           string(stat[:]),
+            Size:           size,
+            VacanciesCount: vc,
+        }
+        log.Println(feeds[url].VacanciesCount)
     }
+    return nil
 }
 
 func countVacancies(url string) (int64, error) {
@@ -108,13 +115,15 @@ func feedInfoHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    if size, _ := getFeedSize(url); size == "" {
-        w.WriteHeader(http.StatusNotFound)
-        return
-    }
-
     _, ok = updaters[url]
     if !ok {
+
+        if !feedIsAlive(url) {
+            log.Printf("%s isn't alive - return 404", url)
+            w.WriteHeader(http.StatusNotFound)
+            return
+        }
+
         if len(updaters) >= FeedsLimit {
             w.WriteHeader(http.StatusPaymentRequired)
             w.Write([]byte(fmt.Sprintf("Feeds limit (%d) is exhausted:\n", FeedsLimit)))
@@ -124,9 +133,17 @@ func feedInfoHandler(w http.ResponseWriter, r *http.Request) {
             return
         }
         go func(c <-chan time.Time, url string) {
-            for {
-                updateInfoIfNeed(url, info)
-                <-c
+            for ; ; <-c {
+                err := updateInfoIfNeed(url, info)
+                if err != nil {
+                    log.Println(err)
+                    feed, ok := info[url]
+                    if ok && feed.FailureSince.IsZero() {
+                        feed.FailureSince = time.Now()
+                    }
+                    continue
+                }
+
                 if time.Since(updaters[url]) > (6 * time.Hour) {
                     log.Printf("info about %s is not requested for 6 hours - cancel monitoring", url)
                     delete(updaters, url)
@@ -142,6 +159,11 @@ func feedInfoHandler(w http.ResponseWriter, r *http.Request) {
     if !ok {
         w.WriteHeader(http.StatusAccepted)
         return
+    }
+    if !feed.FailureSince.IsZero() && time.Since(feed.FailureSince) > 6*time.Hour {
+        log.Printf("info about %s could not be updated for more than 6 hours - return error", url)
+        w.WriteHeader(http.StatusExpectationFailed)
+        w.Write([]byte("information could not be obtained for more than 6 hours"))
     }
     w.Write([]byte(fmt.Sprintf("%s, vacanciesCount: %v", feed.Stat, feed.VacanciesCount)))
 }
